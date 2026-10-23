@@ -676,7 +676,12 @@ async def create_custom_endpoint(
     endpoint_id = f"custom_{uuid.uuid4().hex[:8]}"
 
     model_count, _ = await _validate_provider_connection(endpoint_id, api_key, base_url=base_url)
-    test_provider = create_desktop_provider(endpoint_id, api_key, base_url=base_url)
+    test_provider = create_desktop_provider(
+        endpoint_id,
+        api_key,
+        base_url=base_url,
+        proxy_url=settings.proxy_url or None,
+    )
 
     async with _custom_endpoints_lock:
         endpoints = get_custom_endpoints(settings)
@@ -698,6 +703,7 @@ async def create_custom_endpoint(
             await registry.refresh_models()
         except Exception as e:
             logger.warning("Failed to refresh models after adding custom endpoint %s: %s", endpoint_id, e)
+        model_count = len([m for p, m in registry._full_models if m.provider_id == endpoint_id])
 
     return ProviderInfo(
         id=endpoint_id,
@@ -771,7 +777,12 @@ async def update_custom_endpoint(
     # --- Phase 2: validate (outside lock — network I/O) ---
     if needs_rebuild:
         try:
-            test_provider = create_desktop_provider(endpoint_id, api_key, base_url=base_url)
+            test_provider = create_desktop_provider(
+                endpoint_id,
+                api_key,
+                base_url=base_url,
+                proxy_url=settings.proxy_url or None,
+            )
             models = await test_provider.list_models()
         except Exception as e:
             logger.warning("Failed validation for custom endpoint %s: %s", name, e)
@@ -800,20 +811,44 @@ async def update_custom_endpoint(
         settings.custom_endpoints = json.dumps(endpoints)
         _update_env_file("CODATA_CUSTOM_ENDPOINTS", settings.custom_endpoints)
 
-    if enabled and needs_rebuild and test_provider is not None:
-        registry.unregister(endpoint_id)
-        registry.register(test_provider)
-        try:
-            await registry.refresh_models()
-        except Exception as e:
-            logger.warning("Failed to refresh models after updating custom endpoint %s: %s", endpoint_id, e)
-    elif not enabled:
-        registry.unregister(endpoint_id)
+    if enabled:
+        # Re-enabling a previously disabled endpoint (or anything else that
+        # left it unregistered in this process) must rebuild the provider —
+        # only flipping `enabled` in the persisted config is not enough.
+        # Otherwise the registry has no provider for this ID, model_count
+        # stays 0, and the endpoint's models never reach the chat selector.
+        provider_missing = registry.get_provider(endpoint_id) is None
+        if test_provider is None and (needs_rebuild or provider_missing):
+            try:
+                test_provider = create_desktop_provider(
+                    endpoint_id,
+                    api_key,
+                    base_url=base_url,
+                    proxy_url=settings.proxy_url or None,
+                )
+            except Exception as e:
+                logger.warning("Failed to rebuild custom endpoint %s: %s", endpoint_id, e)
+                raise HTTPException(400, f"Validation failed: {e}")
 
+        if test_provider is not None:
+            registry.unregister(endpoint_id)
+            registry.register(test_provider)
+            try:
+                await registry.refresh_models()
+            except Exception as e:
+                logger.warning("Failed to refresh models after updating custom endpoint %s: %s", endpoint_id, e)
+            models = [m for p, m in registry._full_models if m.provider_id == endpoint_id]
+    else:
+        registry.unregister(endpoint_id)
+        models = []
+
+    registered = enabled and registry.get_provider(endpoint_id) is not None
     return ProviderInfo(
         id=endpoint_id, name=name, is_configured=True, enabled=enabled,
         masked_key=_mask_key(api_key) if api_key else None,
-        model_count=len(models), status="connected" if enabled else "disabled", base_url=base_url
+        model_count=len(models) if registered else 0,
+        status="connected" if registered else ("error" if enabled else "disabled"),
+        base_url=base_url
     )
 
 # ── Default model (server-side mirror of the UI selection) ──────────────────

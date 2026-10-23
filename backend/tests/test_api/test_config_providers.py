@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -184,3 +185,49 @@ class TestDoubaoProviderConfiguration:
         assert len(models) == 1
         assert models[0]["id"] == "doubao-seed-test"
         assert models[0]["provider_id"] == "doubao"
+
+
+class TestCustomEndpointToggle:
+    @pytest.mark.asyncio
+    async def test_reenable_registers_provider_again(self, app_client):
+        """A disabled custom endpoint is unregistered. Enabling it again must
+        rebuild and register the provider, otherwise it stays at 0 models."""
+        settings = app_client.app.state.settings
+        registry = app_client.app.state.provider_registry
+        registry._full_models = []
+
+        endpoint_id = "custom_abc12345"
+        settings.custom_endpoints = json.dumps([
+            {
+                "id": endpoint_id,
+                "name": "Example",
+                "base_url": "https://example.test/v1",
+                "api_key": "sk-test",
+                "enabled": False,
+            },
+        ])
+
+        provider = object()
+        # Before registration the endpoint is absent from the registry;
+        # after register() it resolves to the new provider instance.
+        registry.get_provider.side_effect = (
+            lambda pid: provider if registry.register.called else None
+        )
+
+        with (
+            patch(
+                "app.api.config.create_desktop_provider",
+                return_value=provider,
+            ) as create_provider,
+            patch("app.api.config._update_env_file"),
+        ):
+            resp = await app_client.patch(
+                f"/api/config/custom/{endpoint_id}",
+                json={"enabled": True},
+            )
+
+        assert resp.status_code == 200
+        create_provider.assert_called_once()
+        registry.register.assert_called_once_with(provider)
+        registry.refresh_models.assert_awaited_once()
+        assert resp.json()["status"] == "connected"

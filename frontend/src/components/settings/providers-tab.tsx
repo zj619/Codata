@@ -1158,9 +1158,20 @@ async function setProviderEnabled(provider: ProviderInfo, enabled: boolean) {
 }
 
 async function disableOtherProviders(providers: ProviderInfo[], keepId?: string) {
+  const keepProvider = providers.find((provider) => provider.id === keepId);
+  const keepSource = keepProvider ? providerActiveSource(keepProvider) : null;
+
   await Promise.all(
     providers
-      .filter((provider) => provider.id !== keepId && isProviderEnabled(provider))
+      .filter(
+        (provider) =>
+          provider.id !== keepId &&
+          isProviderEnabled(provider) &&
+          // Multiple providers of the same source are allowed to stay
+          // enabled (e.g. several custom endpoints) — their models are
+          // aggregated by that source. Only switch off other sources.
+          (keepSource === null || providerActiveSource(provider) !== keepSource),
+      )
       .map((provider) => setProviderEnabled(provider, false)),
   );
 }
@@ -1171,11 +1182,13 @@ function applyProviderActivationSnapshot(
 ): ProviderInfo[] | undefined {
   if (!providers) return providers;
 
+  const keepSource = providerActiveSource(request.provider);
+
   return providers.map((provider) => {
     if (provider.id === request.provider.id) {
       return providerSnapshotWithEnabled(provider, request.enabled);
     }
-    if (request.enabled) {
+    if (request.enabled && providerActiveSource(provider) !== keepSource) {
       return providerSnapshotWithEnabled(provider, false);
     }
     return provider;
